@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#2563eb">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>🔬 换能器设备实验预约</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+  <!-- 手机端顶部 App Bar -->
+  <header class="mobile-appbar">
+    <div class="appbar-inner">
+      <div class="app-brand">
+        <div class="app-logo">📡</div>
+        <div class="app-title-box">
+          <h1>换能器设备预约</h1>
+          <p>单台设备 · 防冲突排期 · 自由转让改期</p>
+        </div>
+      </div>
+      <button class="btn-qr-scan" onclick="openQrModal()">
+        <span>📱</span>
+        <span id="topScanBtnText">扫码访问</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- 主体工作区 -->
+  <main class="content-wrapper">
+    <!-- 周导航与快速切下周卡片 -->
+    <section class="week-ctrl-card">
+      <div class="week-main-nav">
+        <button class="btn-icon" onclick="changeWeek(-1)" title="上一周">◀</button>
+        
+        <!-- 大分段切换：本周 VS 预约下一周 -->
+        <div class="week-segmented-tabs">
+          <button class="seg-tab active" id="tabCurrentWeek" onclick="goToCurrentWeek()">📅 本周安排</button>
+          <button class="seg-tab tab-next-week" id="tabNextWeek" onclick="goToNextWeek()">👉 提前约下周</button>
+        </div>
+
+        <button class="btn-icon" onclick="changeWeek(1)" title="下一周">▶</button>
+      </div>
+
+      <!-- 周期文本范围 -->
+      <div class="week-range-text" id="weekRangeLabel">
+        正在加载排期周期...
+      </div>
+
+      <!-- 手机端横向滑动：周一至周日 7 天快速切换胶囊 -->
+      <div class="day-scroll-bar" id="dayPillsContainer" style="margin-top: 12px;">
+        <!-- 由 JS 动态渲染周一至周日的胶囊 -->
+      </div>
+    </section>
+
+    <!-- 次级工具栏（微信群复制、导出Excel、查看全部） -->
+    <div class="sub-tools-bar">
+      <div style="display: flex; gap: 8px;">
+        <button class="btn-tool" id="btnFilterAll" onclick="toggleViewAllDays()">
+          <span id="viewAllIcon">📑</span> <span id="viewAllText">查看整周全貌</span>
+        </button>
+      </div>
+      <div style="display: flex; gap: 8px;">
+        <button class="btn-tool" onclick="openTextSummaryModal()" title="复制排班文字发到实验室微信群">
+          📋 发微信群
+        </button>
+        <button class="btn-tool" onclick="downloadExcel()" title="下载 Excel 表格">
+          📊 导出表格
+        </button>
+      </div>
+    </div>
+
+    <!-- 当日/当周日程内容流 -->
+    <section class="schedule-container" id="scheduleStream">
+      <!-- 动态由 JS 渲染预约卡片、空闲时段引导卡片等 -->
+    </section>
+  </main>
+
+  <!-- 手机端吸底大按钮操作栏 (Bottom Bar) -->
+  <footer class="mobile-bottom-bar">
+    <div class="bottom-bar-inner">
+      <button class="btn-bottom-sub" onclick="openTextSummaryModal()">
+        📋 复制排班发群
+      </button>
+      <button class="btn-bottom-primary" onclick="openCreateSheet()">
+        <span>➕</span>
+        <span>填写实验预约</span>
+      </button>
+    </div>
+  </footer>
+
+  <!-- 底部抽屉 1：新建预约 -->
+  <div class="sheet-overlay" id="createSheet">
+    <div class="sheet-panel">
+      <div class="sheet-handle-bar"></div>
+      <div class="sheet-header">
+        <div class="sheet-title">📝 填写换能器设备预约</div>
+        <button class="sheet-close" onclick="closeSheet('createSheet')">&times;</button>
+      </div>
+      <form id="createForm" onsubmit="handleCreateSubmit(event)">
+        <div class="sheet-body">
+          <div id="createAlert" class="alert-box alert-danger" style="display: none;"></div>
+
+          <!-- 实验人员下拉选择 + 添加人员按钮 -->
+          <div class="form-group">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <label class="form-label" style="margin-bottom:0;">实验人员 <span class="required">*</span></label>
+              <button type="button" class="btn-text-action" onclick="promptAddMember('create')">➕ 添加新成员</button>
+            </div>
+            <select class="form-control" id="createUserName" required>
+              <option value="">-- 请选择实验人员 --</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">预约实验日期 <span class="required">*</span></label>
+            <input type="date" class="form-control" id="createDate" required>
+          </div>
+
+          <!-- 快捷时段大胶囊 (已删除全天便捷时间) -->
+          <div class="form-group">
+            <label class="form-label">快捷时间段选择</label>
+            <div class="slot-shortcuts">
+              <span class="slot-pill" onclick="fillTimeSlot('create', '08:30', '12:00')">上午 08:30~12:00</span>
+              <span class="slot-pill" onclick="fillTimeSlot('create', '13:30', '17:30')">下午 13:30~17:30</span>
+              <span class="slot-pill" onclick="fillTimeSlot('create', '18:30', '22:00')">晚上 18:30~22:00</span>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">开始时间 <span class="required">*</span></label>
+              <input type="time" class="form-control" id="createStartTime" value="09:00" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">结束时间 <span class="required">*</span></label>
+              <input type="time" class="form-control" id="createEndTime" value="12:00" required>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">实验内容 / 样品说明</label>
+            <input type="text" class="form-control" id="createPurpose" placeholder="例如：水下换能器阻抗测量、水听声场测试">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">防误修改PIN码 (选填)</label>
+            <input type="password" maxlength="6" class="form-control" id="createPin" placeholder="可设4位数字防他人误改 (留空则免密自由修改)">
+          </div>
+        </div>
+
+        <div class="sheet-footer">
+          <button type="button" class="btn-card-action" style="padding:10px 16px;" onclick="closeSheet('createSheet')">取消</button>
+          <button type="submit" class="btn-bottom-primary" style="flex:1; max-width: 240px;" id="btnSubmitCreate">确认预约 (防撞车校验)</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 底部抽屉 2：修改 / 转让人员 / 取消预约 -->
+  <div class="sheet-overlay" id="editSheet">
+    <div class="sheet-panel">
+      <div class="sheet-handle-bar"></div>
+      <div class="sheet-header">
+        <div class="sheet-title">⚙️ 调整实验时间 / 变更人员</div>
+        <button class="sheet-close" onclick="closeSheet('editSheet')">&times;</button>
+      </div>
+      <form id="editForm" onsubmit="handleEditSubmit(event)">
+        <input type="hidden" id="editId">
+        <div class="sheet-body">
+          <div id="editAlert" class="alert-box alert-danger" style="display: none;"></div>
+
+          <div class="alert-box alert-warning">
+            💡 支持直接修改<strong>实验时间</strong>，或将时段<strong>转让给其他同学</strong>。系统会自动校验新时段是否有重叠。
+          </div>
+
+          <!-- 实验人员下拉选择 + 添加新人员 -->
+          <div class="form-group">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <label class="form-label" style="margin-bottom:0;">实验人员 <span class="required">* (可改选接替人)</span></label>
+              <button type="button" class="btn-text-action" onclick="promptAddMember('edit')">➕ 添加新成员</button>
+            </div>
+            <select class="form-control" id="editUserName" required>
+              <option value="">-- 请选择实验人员 --</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">预约实验日期 <span class="required">*</span></label>
+            <input type="date" class="form-control" id="editDate" required>
+          </div>
+
+          <!-- 快捷时段调整 (已删除全天) -->
+          <div class="form-group">
+            <label class="form-label">快捷时间段调整</label>
+            <div class="slot-shortcuts">
+              <span class="slot-pill" onclick="fillTimeSlot('edit', '08:30', '12:00')">上午 08:30~12:00</span>
+              <span class="slot-pill" onclick="fillTimeSlot('edit', '13:30', '17:30')">下午 13:30~17:30</span>
+              <span class="slot-pill" onclick="fillTimeSlot('edit', '18:30', '22:00')">晚上 18:30~22:00</span>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">开始时间 <span class="required">*</span></label>
+              <input type="time" class="form-control" id="editStartTime" required>
+            </div>
+            <div class="form-group">
+              <label class="form-label">结束时间 <span class="required">*</span></label>
+              <input type="time" class="form-control" id="editEndTime" required>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">实验内容 / 备注</label>
+            <input type="text" class="form-control" id="editPurpose">
+          </div>
+
+          <div class="form-group" id="editPinGroup">
+            <label class="form-label">PIN码验证 (未设置可留空)</label>
+            <input type="password" maxlength="10" class="form-control" id="editPin" placeholder="若设过PIN请填原PIN (管理口令: admin888)">
+          </div>
+        </div>
+
+        <div class="sheet-footer" style="justify-content: space-between;">
+          <button type="button" class="btn-card-action" style="color: #ef4444; border-color: #fca5a5; background: #fee2e2; padding: 10px 14px;" onclick="handleDeleteCurrent()">取消预约(释放)</button>
+          <div style="display: flex; gap: 8px;">
+            <button type="button" class="btn-card-action" style="padding:10px 14px;" onclick="closeSheet('editSheet')">关闭</button>
+            <button type="submit" class="btn-bottom-primary" style="padding: 10px 18px;" id="btnSubmitEdit">保存修改</button>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 底部抽屉 3：微信群排班文本预览与一键复制 -->
+  <div class="sheet-overlay" id="textSummarySheet">
+    <div class="sheet-panel">
+      <div class="sheet-handle-bar"></div>
+      <div class="sheet-header">
+        <div class="sheet-title">📋 微信群排班日程汇总</div>
+        <button class="sheet-close" onclick="closeSheet('textSummarySheet')">&times;</button>
+      </div>
+      <div class="sheet-body">
+        <p style="font-size: 0.82rem; color: var(--text-muted); margin-bottom: 8px;">
+          点击下方按钮复制文本后，直接打开实验室微信群长按粘贴即可发送：
+        </p>
+        <textarea id="textSummaryContent" class="form-control" rows="10" readonly style="font-family: monospace; font-size: 0.85rem; line-height: 1.5; background: #f8fafc;"></textarea>
+      </div>
+      <div class="sheet-footer">
+        <button type="button" class="btn-card-action" style="padding:10px 16px;" onclick="closeSheet('textSummarySheet')">关闭</button>
+        <button type="button" class="btn-bottom-primary" style="flex:1;" onclick="copySummaryText()">一键复制到剪贴板</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 底部抽屉 4：手机扫码与域名访问指引 -->
+  <div class="sheet-overlay" id="qrSheet">
+    <div class="sheet-panel">
+      <div class="sheet-handle-bar"></div>
+      <div class="sheet-header">
+        <div class="sheet-title">📱 手机访问 (请使用域名)</div>
+        <button class="sheet-close" onclick="closeSheet('qrSheet')">&times;</button>
+      </div>
+      <div class="sheet-body">
+        <!-- 重点提醒：使用域名访问 -->
+        <div class="domain-notice-card">
+          🌐 <strong>手机访问请使用域名！</strong><br>
+          局域网数字 IP 可能会变动导致手机打不开或书签失效，强烈推荐使用<strong>域名</strong>进行访问与扫码。
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" style="font-size:0.85rem;">手机访问域名 / 网址：</label>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" class="form-control" id="customDomainInput" placeholder="请输入实验室域名，如 http://lab-domain:8000" style="height:42px; font-size:0.9rem;">
+            <button type="button" class="btn-tool" style="white-space:nowrap; background:#2563eb; color:white; border:none; padding:0 14px;" onclick="updateDomainQrCode()">更新二维码</button>
+          </div>
+          <div style="font-size:0.75rem; color:#64748b; margin-top:4px;">
+            * 可输入自定义域名或当前访问网址，下方二维码将自动同步生成。
+          </div>
+        </div>
+        
+        <div class="qrcode-box">
+          <div id="qrcodeCanvas"></div>
+          <div id="qrUrlDisplay" style="font-family: monospace; font-size: 0.85rem; font-weight: 700; color: #2563eb; margin-top: 8px; word-break: break-all;"></div>
+        </div>
+
+        <div style="font-size: 0.82rem; color: #64748b; line-height: 1.5; margin-top: 10px;">
+          📌 <strong>手机保存建议</strong>：扫码打开后，在手机浏览器点击「分享」或「菜单」👉 <strong>添加到主屏幕</strong>，以后在手机桌面就像独立 App 一样一触即开！
+        </div>
+      </div>
+      <div class="sheet-footer">
+        <button type="button" class="btn-bottom-primary" style="width: 100%;" onclick="copyCurrentUrl()">复制手机域名访问链接</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 全局 Toast 提示容器 -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- 纯前端零网络依赖 QRCode 生成器与应用脚本 -->
+  <script src="/static/js/qrcode.min.js"></script>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
