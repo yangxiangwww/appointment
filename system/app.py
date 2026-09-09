@@ -1,5 +1,4 @@
-import os
-import sqlite3
+﻿import os
 import socket
 from datetime import datetime, date, timedelta
 from typing import Optional, List
@@ -9,48 +8,110 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 import io
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reservations.db")
+# ----------------- 数据库连接（优先 PostgreSQL，本地用 SQLite） -----------------
+DATABASE_URL = os.environ.get("DATABASE_URL", "")  # Render 注入的 PostgreSQL 连接串
 
-app = FastAPI(title="换能器设备实验预约系统", description="实验室单台换能器专用预约排期管理系统")
+if DATABASE_URL:
+    # ── 云端 PostgreSQL 模式 ──
+    import psycopg2
+    import psycopg2.extras
 
-# ----------------- 数据库初始化 -----------------
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    def get_db():
+        conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+        return conn
+
+    def _ph():
+        return "%s"
+
+    PG_MODE = True
+else:
+    # ── 本地 SQLite 模式（开发调试用）──
+    import sqlite3
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reservations.db")
+
+    def get_db():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ph():
+        return "?"
+
+    PG_MODE = False
+
+
+def dict_row(cursor, row):
+    """将一行数据转为字典，兼容 PostgreSQL 与 SQLite"""
+    if PG_MODE:
+        cols = [desc[0] for desc in cursor.description]
+        return dict(zip(cols, row))
+    else:
+        return dict(row)
+
 
 def init_db():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS reservations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_name TEXT NOT NULL,
-            contact TEXT DEFAULT '',
-            reserve_date TEXT NOT NULL,  -- YYYY-MM-DD
-            start_time TEXT NOT NULL,    -- HH:MM
-            end_time TEXT NOT NULL,      -- HH:MM
-            purpose TEXT DEFAULT '',
-            pin TEXT DEFAULT '',         -- 4位数字修改防误碰口令，为空则任意修改
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # 实验人员表
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # 初始化默认实验人员
-    default_members = ["向阳", "邓斌", "朱书铔", "周邱玲", "李成相", "何忮芮"]
-    for m in default_members:
-        cursor.execute("INSERT OR IGNORE INTO members (name) VALUES (?)", (m,))
+
+    if PG_MODE:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reservations (
+                id SERIAL PRIMARY KEY,
+                user_name TEXT NOT NULL,
+                contact TEXT DEFAULT '',
+                reserve_date TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                purpose TEXT DEFAULT '',
+                pin TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS members (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        default_members = ["向阳", "邓斌", "朱书铔", "周邱玲", "李成相", "何忮芮"]
+        for m in default_members:
+            cursor.execute(
+                "INSERT INTO members (name) VALUES (%s) ON CONFLICT (name) DO NOTHING",
+                (m,)
+            )
+    else:
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reservations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_name TEXT NOT NULL,
+                contact TEXT DEFAULT '',
+                reserve_date TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                purpose TEXT DEFAULT '',
+                pin TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        default_members = ["向阳", "邓斌", "朱书铔", "周邱玲", "李成相", "何忮芮"]
+        for m in default_members:
+            cursor.execute("INSERT OR IGNORE INTO members (name) VALUES (?)", (m,))
 
     conn.commit()
     conn.close()
+
+
+app = FastAPI(title="换能器设备实验预约系统", description="实验室单台换能器专用预约排期管理系统")
 
 init_db()
 
@@ -77,31 +138,30 @@ class ReservationUpdate(BaseModel):
     pin: Optional[str] = Field("", max_length=10, description="验证原PIN码或新设PIN码")
 
 # ----------------- 冲突检测通用算法 -----------------
-def check_time_conflict(conn, reserve_date: str, start_time: str, end_time: str, exclude_id: Optional[int] = None):
-    """
-    检查同一天是否存在时间重叠：
-    两时间段 [startA, endA] 与 [startB, endB] 重叠的充要条件：
-    startA < endB 且 endA > startB
-    """
+def check_time_conflict(conn, reserve_date: str, start_time: str, end_time: str, exclude_id=None):
     if start_time >= end_time:
         raise HTTPException(status_code=400, detail="开始时间必须早于结束时间！")
 
     cursor = conn.cursor()
-    query = """
+    ph = _ph()
+
+    query = f"""
         SELECT id, user_name, start_time, end_time, purpose
         FROM reservations
-        WHERE reserve_date = ?
-          AND start_time < ?
-          AND end_time > ?
+        WHERE reserve_date = {ph}
+          AND start_time < {ph}
+          AND end_time > {ph}
     """
     params = [reserve_date, end_time, start_time]
 
     if exclude_id is not None:
-        query += " AND id != ?"
+        query += f" AND id != {ph}"
         params.append(exclude_id)
 
     cursor.execute(query, params)
-    conflicts = cursor.fetchall()
+    rows = cursor.fetchall()
+    conflicts = [dict_row(cursor, r) for r in rows]
+
     if conflicts:
         conflict_list = [
             f"{c['user_name']} ({c['start_time']}~{c['end_time']})"
@@ -116,36 +176,50 @@ def check_time_conflict(conn, reserve_date: str, start_time: str, end_time: str,
 
 @app.get("/api/members")
 def list_members():
-    """获取所有可用实验人员"""
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute("SELECT id, name FROM members ORDER BY id ASC")
     rows = cursor.fetchall()
+    result = [dict_row(cursor, r) for r in rows]
     conn.close()
-    return [{"id": r["id"], "name": r["name"]} for r in rows]
+    return result
 
 @app.post("/api/members")
 def add_member(data: MemberCreate):
-    """添加新实验人员并持久化"""
     name = data.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="人员姓名不能为空！")
     conn = get_db()
     cursor = conn.cursor()
+    ph = _ph()
     try:
-        cursor.execute("INSERT INTO members (name) VALUES (?)", (name,))
+        if PG_MODE:
+            cursor.execute(
+                f"INSERT INTO members (name) VALUES ({ph}) ON CONFLICT (name) DO NOTHING RETURNING id",
+                (name,)
+            )
+            row = cursor.fetchone()
+            if row:
+                new_id = row[0]
+            else:
+                cursor.execute(f"SELECT id FROM members WHERE name = {ph}", (name,))
+                new_id = cursor.fetchone()[0]
+        else:
+            cursor.execute(f"INSERT OR IGNORE INTO members (name) VALUES ({ph})", (name,))
+            if cursor.lastrowid:
+                new_id = cursor.lastrowid
+            else:
+                cursor.execute(f"SELECT id FROM members WHERE name = {ph}", (name,))
+                new_id = cursor.fetchone()["id"]
         conn.commit()
-        new_id = cursor.lastrowid
-    except sqlite3.IntegrityError:
-        cursor.execute("SELECT id FROM members WHERE name = ?", (name,))
-        existing = cursor.fetchone()
-        new_id = existing["id"] if existing else 0
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"添加失败：{str(e)}")
     conn.close()
     return {"status": "success", "id": new_id, "name": name}
 
 @app.get("/api/system-info")
 def get_system_info():
-    """获取本机信息和IP，用于局域网与域名展示"""
     ip_list = []
     try:
         hostname = socket.gethostname()
@@ -159,23 +233,24 @@ def get_system_info():
         "current_date": date.today().isoformat(),
         "lan_ips": ip_list,
         "default_port": 8000,
-        "domain_recommendation": "手机访问推荐使用实验室分配的域名（例如 http://your-domain:8000），避免局域网 IP 变更"
+        "domain_recommendation": "手机访问推荐使用实验室分配的域名"
     }
 
 @app.get("/api/reservations")
 def list_reservations(
-    start_date: Optional[str] = Query(None, description="起始日期 YYYY-MM-DD"),
-    end_date: Optional[str] = Query(None, description="结束日期 YYYY-MM-DD")
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None)
 ):
-    """获取预约列表，支持按日期范围过滤"""
     conn = get_db()
     cursor = conn.cursor()
+    ph = _ph()
     if start_date and end_date:
         cursor.execute(
-            """
-            SELECT id, user_name, contact, reserve_date, start_time, end_time, purpose, (pin != '') as has_pin, created_at
+            f"""
+            SELECT id, user_name, contact, reserve_date, start_time, end_time, purpose,
+                   CASE WHEN pin != '' THEN 1 ELSE 0 END as has_pin, created_at
             FROM reservations
-            WHERE reserve_date >= ? AND reserve_date <= ?
+            WHERE reserve_date >= {ph} AND reserve_date <= {ph}
             ORDER BY reserve_date ASC, start_time ASC
             """,
             (start_date, end_date)
@@ -183,141 +258,146 @@ def list_reservations(
     else:
         cursor.execute(
             """
-            SELECT id, user_name, contact, reserve_date, start_time, end_time, purpose, (pin != '') as has_pin, created_at
+            SELECT id, user_name, contact, reserve_date, start_time, end_time, purpose,
+                   CASE WHEN pin != '' THEN 1 ELSE 0 END as has_pin, created_at
             FROM reservations
             ORDER BY reserve_date ASC, start_time ASC
             """
         )
     rows = cursor.fetchall()
-    conn.close()
-
     result = []
     for r in rows:
+        d = dict_row(cursor, r)
         result.append({
-            "id": r["id"],
-            "user_name": r["user_name"],
-            "contact": r["contact"],
-            "reserve_date": r["reserve_date"],
-            "start_time": r["start_time"],
-            "end_time": r["end_time"],
-            "purpose": r["purpose"],
-            "has_pin": bool(r["has_pin"]),
-            "created_at": r["created_at"]
+            "id": d["id"],
+            "user_name": d["user_name"],
+            "contact": d.get("contact", ""),
+            "reserve_date": d["reserve_date"],
+            "start_time": d["start_time"],
+            "end_time": d["end_time"],
+            "purpose": d.get("purpose", ""),
+            "has_pin": bool(d["has_pin"]),
+            "created_at": str(d["created_at"])
         })
+    conn.close()
     return result
 
 @app.post("/api/reservations")
 def create_reservation(data: ReservationCreate):
-    """创建新预约"""
     conn = get_db()
-    # 冲突校验
     check_time_conflict(conn, data.reserve_date, data.start_time, data.end_time)
-
     cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT INTO reservations (user_name, contact, reserve_date, start_time, end_time, purpose, pin)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (data.user_name.strip(), data.contact.strip(), data.reserve_date, data.start_time, data.end_time, data.purpose.strip(), data.pin.strip())
-    )
+    ph = _ph()
+    if PG_MODE:
+        cursor.execute(
+            f"""
+            INSERT INTO reservations (user_name, contact, reserve_date, start_time, end_time, purpose, pin)
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph}) RETURNING id
+            """,
+            (data.user_name.strip(), data.contact.strip(), data.reserve_date, data.start_time, data.end_time, data.purpose.strip(), data.pin.strip())
+        )
+        new_id = cursor.fetchone()[0]
+    else:
+        cursor.execute(
+            f"""
+            INSERT INTO reservations (user_name, contact, reserve_date, start_time, end_time, purpose, pin)
+            VALUES ({ph}, {ph}, {ph}, {ph}, {ph}, {ph}, {ph})
+            """,
+            (data.user_name.strip(), data.contact.strip(), data.reserve_date, data.start_time, data.end_time, data.purpose.strip(), data.pin.strip())
+        )
+        new_id = cursor.lastrowid
     conn.commit()
-    new_id = cursor.lastrowid
     conn.close()
-
     return {"status": "success", "id": new_id, "message": "换能器设备预约成功！"}
 
 @app.put("/api/reservations/{reservation_id}")
 def update_reservation(reservation_id: int, data: ReservationUpdate):
-    """灵活修改实验时间、修改/转让实验人员、更新内容"""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,))
-    record = cursor.fetchone()
-    if not record:
+    ph = _ph()
+    cursor.execute(f"SELECT * FROM reservations WHERE id = {ph}", (reservation_id,))
+    row = cursor.fetchone()
+    if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="未找到该预约记录！")
+    record = dict_row(cursor, row)
 
-    # 如果原记录设置了PIN码，修改时必须匹配
-    existing_pin = record["pin"]
+    existing_pin = record.get("pin", "")
     if existing_pin and existing_pin.strip():
         if data.pin.strip() != existing_pin.strip() and data.pin.strip() != "admin888":
             conn.close()
             raise HTTPException(status_code=403, detail="修改密码(PIN)不正确，无法修改！若忘记密码请联系管理员(管理口令: admin888)。")
 
-    # 冲突检测（排除自己）
     check_time_conflict(conn, data.reserve_date, data.start_time, data.end_time, exclude_id=reservation_id)
 
-    # 保留原 PIN 或允许更新
     new_pin = data.pin.strip() if data.pin.strip() and data.pin.strip() != "admin888" else existing_pin
 
     cursor.execute(
-        """
+        f"""
         UPDATE reservations
-        SET user_name = ?, contact = ?, reserve_date = ?, start_time = ?, end_time = ?, purpose = ?, pin = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
+        SET user_name = {ph}, contact = {ph}, reserve_date = {ph}, start_time = {ph},
+            end_time = {ph}, purpose = {ph}, pin = {ph}, updated_at = CURRENT_TIMESTAMP
+        WHERE id = {ph}
         """,
         (data.user_name.strip(), data.contact.strip(), data.reserve_date, data.start_time, data.end_time, data.purpose.strip(), new_pin, reservation_id)
     )
     conn.commit()
     conn.close()
-
     return {"status": "success", "message": "预约修改成功！已同步更新实验人员与时段。"}
 
 @app.delete("/api/reservations/{reservation_id}")
 def delete_reservation(reservation_id: int, pin: Optional[str] = Query("")):
-    """取消/删除预约，释放设备"""
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,))
-    record = cursor.fetchone()
-    if not record:
+    ph = _ph()
+    cursor.execute(f"SELECT * FROM reservations WHERE id = {ph}", (reservation_id,))
+    row = cursor.fetchone()
+    if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="未找到该预约记录！")
+    record = dict_row(cursor, row)
 
-    existing_pin = record["pin"]
+    existing_pin = record.get("pin", "")
     if existing_pin and existing_pin.strip():
         if (pin or "").strip() != existing_pin.strip() and (pin or "").strip() != "admin888":
             conn.close()
             raise HTTPException(status_code=403, detail="取消密码(PIN)不正确！若忘记密码请输入管理员口令: admin888")
 
-    cursor.execute("DELETE FROM reservations WHERE id = ?", (reservation_id,))
+    cursor.execute(f"DELETE FROM reservations WHERE id = {ph}", (reservation_id,))
     conn.commit()
     conn.close()
-
     return {"status": "success", "message": "预约已取消，设备时段已释放。"}
 
 @app.get("/api/export/text")
 def export_text_summary(
-    start_date: str = Query(..., description="起始日期 YYYY-MM-DD"),
-    end_date: str = Query(..., description="结束日期 YYYY-MM-DD")
+    start_date: str = Query(...),
+    end_date: str = Query(...)
 ):
-    """一键生成适合微信/QQ群发送的格式化排班文本"""
     conn = get_db()
     cursor = conn.cursor()
+    ph = _ph()
     cursor.execute(
-        """
+        f"""
         SELECT reserve_date, start_time, end_time, user_name, contact, purpose
         FROM reservations
-        WHERE reserve_date >= ? AND reserve_date <= ?
+        WHERE reserve_date >= {ph} AND reserve_date <= {ph}
         ORDER BY reserve_date ASC, start_time ASC
         """,
         (start_date, end_date)
     )
-    records = cursor.fetchall()
+    rows = cursor.fetchall()
+    records = [dict_row(cursor, r) for r in rows]
     conn.close()
 
-    # 按星期组织
     weekday_map = {0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日"}
     start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
     end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
 
     lines = []
-    lines.append(f"📢【换能器设备使用排期表】")
+    lines.append("📢【换能器设备使用排期表】")
     lines.append(f"📅 周期：{start_date} 至 {end_date}")
     lines.append("─────────────────────")
 
-    # 按天归类
     day_dict = {}
     cur = start_dt
     while cur <= end_dt:
@@ -348,32 +428,31 @@ def export_text_summary(
 
 @app.get("/api/export/excel")
 def export_excel(
-    start_date: str = Query(..., description="起始日期 YYYY-MM-DD"),
-    end_date: str = Query(..., description="结束日期 YYYY-MM-DD")
+    start_date: str = Query(...),
+    end_date: str = Query(...)
 ):
-    """导出 Excel 格式排班表"""
     from openpyxl import Workbook
     conn = get_db()
     cursor = conn.cursor()
+    ph = _ph()
     cursor.execute(
-        """
+        f"""
         SELECT reserve_date, start_time, end_time, user_name, purpose, created_at
         FROM reservations
-        WHERE reserve_date >= ? AND reserve_date <= ?
+        WHERE reserve_date >= {ph} AND reserve_date <= {ph}
         ORDER BY reserve_date ASC, start_time ASC
         """,
         (start_date, end_date)
     )
-    records = cursor.fetchall()
+    rows = cursor.fetchall()
+    records = [dict_row(cursor, r) for r in rows]
     conn.close()
 
     weekday_map = {0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日"}
-
     wb = Workbook()
     ws = wb.active
     ws.title = "换能器预约排期"
     ws.append(["实验日期", "星期", "开始时间", "结束时间", "预约人", "实验内容/说明", "预约提交时间"])
-
     for r in records:
         d_obj = datetime.strptime(r["reserve_date"], "%Y-%m-%d").date()
         ws.append([
@@ -382,8 +461,8 @@ def export_excel(
             r["start_time"],
             r["end_time"],
             r["user_name"],
-            r["purpose"],
-            r["created_at"]
+            r.get("purpose", ""),
+            str(r["created_at"])
         ])
 
     output = io.BytesIO()
@@ -393,7 +472,6 @@ def export_excel(
     filename = f"换能器预约排班_{start_date}_至_{end_date}.xlsx"
     from urllib.parse import quote
     encoded_filename = quote(filename)
-
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -414,21 +492,6 @@ def read_index():
         return FileResponse(index_path)
     return {"message": "换能器预约系统正在启动中..."}
 
-# ----------------- 兼容 Hugging Face 免费免绑卡模式 -----------------
-try:
-    import gradio as gr
-    with gr.Blocks(title="换能器设备实验预约") as demo:
-        gr.HTML("""
-        <div style="text-align:center; padding: 20px;">
-          <h3>正在跳转至预约系统...</h3>
-          <p><a href="/">若未跳转，请点击此处进入</a></p>
-        </div>
-        <script>window.location.href = '/';</script>
-        """)
-    app = gr.mount_gradio_app(app, demo, path="/_gradio")
-except Exception:
-    pass
-
 if __name__ == "__main__":
     import uvicorn
     hostname = socket.gethostname()
@@ -440,9 +503,7 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    # 优先读取云端环境变量 PORT (Hugging Face 默认为 7860)，本地默认为 8000
-    port = int(os.environ.get("PORT", 7860 if "SPACE_ID" in os.environ else 8000))
-
+    port = int(os.environ.get("PORT", 8000))
     print("=" * 66)
     print("🔬 换能器设备实验预约系统 · 手机版与电脑版已就绪！")
     print("=" * 66)
